@@ -12,11 +12,11 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import Config
 from database import Database
 from middlewares.access import AdminAccessMiddleware
-from services.confirmations import ConfirmationStore, KeyedLocks
-from services.moderation import apply_to_chat, run_global
+from services.confirmations import ConfirmationStore, KeyedLocks, PendingGlobal
+from services.moderation import GlobalReport, apply_to_chat, run_global
 from utils import texts
-from utils.helpers import display_name
-from utils.targets import ParsedTarget, TargetError, parse_target, validate_target
+from utils.helpers import display_name, esc
+from utils.targets import ParsedTarget, TargetError, resolve_target, validate_target
 
 log = logging.getLogger(__name__)
 
@@ -25,10 +25,12 @@ router.message.middleware(AdminAccessMiddleware())
 router.callback_query.middleware(AdminAccessMiddleware())
 
 
-async def _prepare_target(message: Message, command: CommandObject, bot: Bot, config: Config) -> ParsedTarget | None:
+async def _prepare_target(
+    message: Message, command: CommandObject, bot: Bot, db: Database, config: Config
+) -> ParsedTarget | None:
     """Определяет и проверяет пользователя. При ошибке отвечает в чат и возвращает None."""
     try:
-        target = parse_target(message, command.args)
+        target = await resolve_target(message, command.args, db)
         validate_target(target.user_id, bot.id, message.from_user.id, config.admin_ids)
     except TargetError as exc:
         await message.reply(str(exc))
@@ -40,7 +42,7 @@ async def _prepare_target(message: Message, command: CommandObject, bot: Bot, co
 async def _run_local(
     message: Message, command: CommandObject, bot: Bot, db: Database, config: Config, locks: KeyedLocks, action: str
 ) -> None:
-    target = await _prepare_target(message, command, bot, config)
+    target = await _prepare_target(message, command, bot, db, config)
     if target is None:
         return
     chat, executor = message.chat, message.from_user
@@ -48,8 +50,11 @@ async def _run_local(
     async with locks.hold(("local", chat.id, target.user_id)):
         result = await apply_to_chat(bot, chat.id, chat.title or str(chat.id), target.user_id, action)
         await db.log_action(action, executor.id, target.user_id, chat.id, target.reason, result.outcome.value)
+    verbose = chat.id in config.admin_chat_ids  # подробный ответ только в служебных чатах
     await message.reply(
-        texts.local_reply(action, result.outcome, result.detail, target.user_id, display_name(executor), target.reason)
+        texts.local_reply(
+            action, result.outcome, result.detail, target.user_id, display_name(executor), target.reason, verbose
+        )
     )
 
 
@@ -73,7 +78,7 @@ async def _ask_global(
     message: Message, command: CommandObject, bot: Bot, db: Database, config: Config,
     confirmations: ConfirmationStore, kind: str,
 ) -> None:
-    target = await _prepare_target(message, command, bot, config)
+    target = await _prepare_target(message, command, bot, db, config)
     if target is None:
         return
     chats = await db.list_chats(active_only=True)
@@ -82,7 +87,8 @@ async def _ask_global(
         return
     executor = message.from_user
     pending = confirmations.create(
-        kind, target.user_id, target.reason, executor.id, display_name(executor), message.chat.id, config.confirm_ttl
+        kind, target.user_id, target.reason, executor.id, display_name(executor), message.chat.id, config.confirm_ttl,
+        target_label=target.label,
     )
     markup = InlineKeyboardMarkup(
         inline_keyboard=[[
@@ -90,8 +96,10 @@ async def _ask_global(
             InlineKeyboardButton(text="Отмена", callback_data=f"g:n:{pending.token}"),
         ]]
     )
+    verbose = message.chat.id in config.admin_chat_ids
     await message.reply(
-        texts.confirm_text(kind, target.user_id, target.reason, len(chats), config.confirm_ttl), reply_markup=markup
+        texts.confirm_text(kind, target.label, target.reason, len(chats), config.confirm_ttl, verbose),
+        reply_markup=markup,
     )
 
 
@@ -121,6 +129,22 @@ async def _edit(message, text: str) -> None:
         await message.edit_text(text)
     except TelegramAPIError as exc:
         log.warning("Не удалось изменить сообщение: %s", exc)
+
+
+async def _copy_report_to_admin_chats(bot: Bot, config: Config, chat, pending: PendingGlobal, report: GlobalReport) -> None:
+    """Подробный отчёт о глобальной операции из обычного чата отправляется в служебные чаты."""
+    title = getattr(chat, "title", None) or str(chat.id)
+    header = (
+        f"Глобальная операция из чата «{esc(title)}» ({chat.id}).\n"
+        f"Исполнитель: {esc(pending.executor_name)} ({pending.executor_id}).\n"
+        f"Пользователь: {esc(pending.target_label)}.\n{texts.reason_line(pending.reason)}\n\n"
+    )
+    text = (header + texts.format_global_report(report))[:4000]
+    for admin_chat in sorted(config.admin_chat_ids):
+        try:
+            await bot.send_message(admin_chat, text)
+        except TelegramAPIError as exc:
+            log.warning("Не удалось отправить отчёт в служебный чат %s: %s", admin_chat, exc)
 
 
 @router.callback_query(F.data.startswith("g:"))
@@ -161,14 +185,20 @@ async def on_global_confirmation(
 
     await call.answer("Выполняю…")
     async with global_lock:
-        await _edit(call.message, "Выполняю глобальную операцию. Это может занять некоторое время…")
+        await _edit(call.message, "Выполняю команду…")
         try:
             report = await run_global(
                 bot, db, pending.kind, pending.target_id, pending.executor_id, pending.reason, pending.chat_id
             )
         except Exception:
             log.exception("Ошибка при выполнении глобальной операции")
-            await _edit(call.message, "Глобальная операция прервана из-за непредвиденной ошибки. Подробности в журнале бота.")
+            await _edit(call.message, "Команда прервана из-за непредвиденной ошибки. Подробности в журнале бота.")
             return
-    secure = pending.chat_id in config.admin_chat_ids
-    await _edit(call.message, texts.format_global_report(report, secure))
+
+    if pending.chat_id in config.admin_chat_ids:
+        await _edit(call.message, texts.format_global_report(report))  # служебный чат: подробный отчёт
+        return
+    # Обычный чат: коротко, без счётчиков. Подробности уходят в служебные чаты.
+    await _edit(call.message, texts.short_global_reply(report, bool(config.admin_chat_ids)))
+    if config.admin_chat_ids:
+        await _copy_report_to_admin_chats(bot, config, call.message.chat, pending, report)

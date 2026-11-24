@@ -11,7 +11,7 @@ from services.moderation import scan_membership
 from services.users import resolve_user_name
 from utils import texts
 from utils.helpers import esc, fmt_time
-from utils.targets import TargetError, parse_target
+from utils.targets import TargetError, resolve_target
 
 router = Router(name="userinfo")  # доступна всем участникам
 
@@ -20,7 +20,7 @@ router = Router(name="userinfo")  # доступна всем участника
 async def cmd_userinfo(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config):
     requester = message.from_user
     try:
-        target = parse_target(message, command.args, allow_empty=True)
+        target = await resolve_target(message, command.args, db, allow_empty=True)
     except TargetError as exc:
         await message.reply(str(exc))
         return
@@ -35,7 +35,7 @@ async def cmd_userinfo(message: Message, command: CommandObject, bot: Bot, db: D
     if requester.id in config.admin_ids:
         if message.chat.id not in config.admin_chat_ids:
             # Административные сведения не публикуются в открытых чатах
-            lines += ["", f"Административные сведения не публикуются в открытом чате. {texts.SECURE_ONLY}"]
+            lines += ["", "Административные сведения доступны только в служебных чатах."]
         else:
             lines += await _admin_details(bot, db, config, user_id)
     await message.reply("\n".join(lines))

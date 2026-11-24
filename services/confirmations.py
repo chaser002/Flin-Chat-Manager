@@ -18,6 +18,7 @@ class PendingGlobal:
     executor_name: str
     chat_id: int
     expires_at: float
+    target_label: str = ""
 
 
 class ConfirmationStore:
@@ -28,7 +29,8 @@ class ConfirmationStore:
         self._clock = clock
 
     def create(
-        self, kind: str, target_id: int, reason: str, executor_id: int, executor_name: str, chat_id: int, ttl: int
+        self, kind: str, target_id: int, reason: str, executor_id: int, executor_name: str, chat_id: int, ttl: int,
+        target_label: str = "",
     ) -> PendingGlobal:
         self._purge()
         pending = PendingGlobal(
@@ -40,6 +42,7 @@ class ConfirmationStore:
             executor_name=executor_name,
             chat_id=chat_id,
             expires_at=self._clock() + ttl,
+            target_label=target_label or f"ID {target_id}",
         )
         self._items[pending.token] = pending
         return pending

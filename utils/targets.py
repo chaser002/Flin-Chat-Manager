@@ -1,12 +1,16 @@
-"""Определение пользователя, к которому применяется команда: Reply или Telegram ID."""
+"""Определение пользователя, к которому применяется команда: Reply, Telegram ID или @username."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+
+from utils.helpers import display_name
 
 ANONYMOUS_ADMIN_ID = 1087968824  # служебный аккаунт «Анонимный администратор»
 MAX_REASON_LENGTH = 200
 MAX_USER_ID = 10**13
+USERNAME_RE = re.compile(r"^@([A-Za-z][A-Za-z0-9_]{4,31})$")
 
 
 class TargetError(Exception):
@@ -16,8 +20,13 @@ class TargetError(Exception):
 @dataclass(slots=True)
 class ParsedTarget:
     user_id: int
-    user: Any | None  # объект пользователя, если команда вызвана ответом на сообщение
+    user: Any | None  # объект пользователя, если он известен из сообщения
     reason: str
+    username: str | None = None  # если цель указана через @username
+
+    @property
+    def label(self) -> str:
+        return f"@{self.username} (ID {self.user_id})" if self.username else f"ID {self.user_id}"
 
 
 def real_reply(message):
@@ -37,7 +46,7 @@ def clean_reason(text: str) -> str:
 
 
 def parse_target(message, args: str | None, *, allow_empty: bool = False) -> ParsedTarget | None:
-    """Разбирает цель команды.
+    """Разбирает цель команды: Reply на сообщение или Telegram ID.
 
     Reply на сообщение: причина — весь текст после команды.
     Telegram ID: первый аргумент — ID, остальное — причина.
@@ -54,10 +63,57 @@ def parse_target(message, args: str | None, *, allow_empty: bool = False) -> Par
     if not first:
         if allow_empty:
             return None
-        raise TargetError("Укажите пользователя: ответьте на его сообщение или укажите Telegram ID.")
+        raise TargetError("Укажите пользователя: ответьте на его сообщение, укажите @username или Telegram ID.")
     if not (first.isascii() and first.isdigit()) or not 0 < int(first) < MAX_USER_ID:
-        raise TargetError("Некорректный Telegram ID. Укажите положительное число или ответьте на сообщение пользователя.")
+        raise TargetError("Некорректный Telegram ID. Укажите @username, положительное число или ответьте на сообщение.")
     return ParsedTarget(int(first), None, clean_reason(rest))
+
+
+def _text_mention(message):
+    """Пользователь, выбранный из подсказки Telegram (так отмечают людей без @username)."""
+    for entity in getattr(message, "entities", None) or []:
+        kind = str(getattr(entity.type, "value", entity.type))
+        if kind == "text_mention" and getattr(entity, "user", None) is not None:
+            data = (message.text or "").encode("utf-16-le")  # смещения в Telegram считаются в UTF-16
+            after = data[(entity.offset + entity.length) * 2:].decode("utf-16-le")
+            return entity.user, clean_reason(after)
+    return None
+
+
+async def resolve_target(message, args: str | None, db, *, allow_empty: bool = False) -> ParsedTarget | None:
+    """Определяет цель команды: Reply, отметка пользователя, @username или Telegram ID.
+
+    Telegram не позволяет боту найти человека по @username, поэтому бот ищет его среди тех, кого уже видел
+    в подключённых чатах (сообщения, вступления). Если человека бот не знает, нужен Reply или Telegram ID.
+    """
+    args = (args or "").strip()
+    target: ParsedTarget | None
+    if real_reply(message) is not None:
+        target = parse_target(message, args, allow_empty=allow_empty)
+    elif (mention := _text_mention(message)) is not None:
+        user, reason = mention
+        target = ParsedTarget(user.id, user, reason)
+    else:
+        first, _, rest = args.partition(" ")
+        if first.startswith("@"):
+            match = USERNAME_RE.match(first)
+            if not match:
+                raise TargetError("Некорректный @username.")
+            rows = await db.find_users_by_username(match.group(1))
+            if not rows:
+                raise TargetError(
+                    f"Пользователь {first} не найден: бот ещё не видел его в подключённых чатах. "
+                    "Используйте Reply или Telegram ID."
+                )
+            if len(rows) > 1:
+                raise TargetError("Найдено несколько пользователей с таким @username. Используйте Reply или Telegram ID.")
+            target = ParsedTarget(rows[0]["user_id"], None, clean_reason(rest), username=match.group(1))
+        else:
+            target = parse_target(message, args, allow_empty=allow_empty)
+
+    if target is not None and target.user is not None:
+        await db.upsert_user(target.user.id, getattr(target.user, "username", None), display_name(target.user))
+    return target
 
 
 def validate_target(user_id: int, bot_id: int, executor_id: int, admin_ids) -> None:

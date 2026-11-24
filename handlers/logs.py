@@ -17,7 +17,7 @@ router.message.middleware(AdminAccessMiddleware())
 @router.message(Command("logs"))
 async def cmd_logs(message: Message, command: CommandObject, db: Database, config: Config):
     if message.chat.id not in config.admin_chat_ids:
-        await message.reply(f"Журнал не публикуется в открытом чате. {texts.SECURE_ONLY}")
+        await message.reply(texts.SECURE_ONLY)
         return
     arg = (command.args or "").strip()
     limit = int(arg) if arg.isascii() and arg.isdigit() else 10

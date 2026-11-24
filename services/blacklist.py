@@ -25,9 +25,9 @@ async def handle_blacklisted_join(bot, db: Database, config: Config, chat, user)
         res = await apply_to_chat(bot, chat.id, chat.title or str(chat.id), user.id, "ban")
         await db.log_action("autoban", bot.id, user.id, chat.id, "Автоматически: пользователь в Blacklist", res.outcome.value)
         if res.outcome in (Outcome.SUCCESS, Outcome.ALREADY):
-            await _send(bot, chat.id, f"Пользователь из Blacklist автоматически заблокирован в этом чате.\nID: {user.id}")
+            await _send(bot, chat.id, "Пользователь из Blacklist автоматически заблокирован.")
             return "autoban"
-        outcome_note = f"\nАвтоматическая блокировка не выполнена: {OUTCOME_LABELS[res.outcome]}."
+        outcome_note = f" Автоблокировка не выполнена: {OUTCOME_LABELS[res.outcome]}."
     else:
         await db.log_action("autonotify", bot.id, user.id, chat.id, "Пользователь из Blacklist вступил в чат", "success")
 
@@ -35,8 +35,7 @@ async def handle_blacklisted_join(bot, db: Database, config: Config, chat, user)
     await _send(
         bot,
         chat.id,
-        f"Внимание! В чат вступил пользователь из Blacklist.\nID: {user.id}{outcome_note}\n"
-        f"Требуется внимание администрации. {admins}".strip(),
+        f"Внимание! В чат вступил пользователь из Blacklist.{outcome_note} Требуется внимание администрации. {admins}".strip(),
     )
     return "notify"
 

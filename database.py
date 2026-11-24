@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS known_users (
     last_seen INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_known_username ON known_users (username COLLATE NOCASE);
+
 CREATE TABLE IF NOT EXISTS blacklist (
     user_id    INTEGER PRIMARY KEY,
     name       TEXT    NOT NULL,
@@ -162,6 +164,10 @@ class Database:
 
     async def get_known_user(self, user_id: int) -> dict | None:
         return await self._fetchone("SELECT * FROM known_users WHERE user_id=?", (user_id,))
+
+    async def find_users_by_username(self, username: str) -> list[dict]:
+        """Ищет среди пользователей, которых бот видел в чатах. Регистр не важен."""
+        return await self._fetchall("SELECT * FROM known_users WHERE username = ? COLLATE NOCASE", (username,))
 
     # ───────── blacklist ─────────
     async def add_blacklist(self, user_id: int, name: str, reason: str, added_by: int) -> bool:

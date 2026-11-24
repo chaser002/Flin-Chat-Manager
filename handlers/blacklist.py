@@ -15,7 +15,7 @@ from services.blacklist import handle_blacklisted_join
 from services.users import resolve_user_name
 from utils import texts
 from utils.helpers import display_name, esc, fmt_time
-from utils.targets import TargetError, parse_target, validate_target
+from utils.targets import ParsedTarget, TargetError, resolve_target, validate_target
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +27,13 @@ router.message.middleware(AdminAccessMiddleware())
 events_router = Router(name="blacklist_events")
 
 
-async def _target(message: Message, command: CommandObject, bot: Bot, config: Config):
+async def _target(
+    message: Message, command: CommandObject, bot: Bot, db: Database, config: Config, validate: bool = True
+) -> ParsedTarget | None:
     try:
-        target = parse_target(message, command.args)
-        validate_target(target.user_id, bot.id, message.from_user.id, config.admin_ids)
+        target = await resolve_target(message, command.args, db)
+        if validate:
+            validate_target(target.user_id, bot.id, message.from_user.id, config.admin_ids)
     except TargetError as exc:
         await message.reply(str(exc))
         return None
@@ -39,38 +42,38 @@ async def _target(message: Message, command: CommandObject, bot: Bot, config: Co
 
 @router.message(Command("addblacklist"))
 async def cmd_add(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config):
-    target = await _target(message, command, bot, config)
+    target = await _target(message, command, bot, db, config)
     if target is None:
         return
     executor = message.from_user
+    verbose = message.chat.id in config.admin_chat_ids
     name = await resolve_user_name(bot, db, message.chat.id, target.user_id, target.user) or "Неизвестно"
     reason = target.reason or texts.NO_REASON
     if not await db.add_blacklist(target.user_id, name, reason, executor.id):
-        await message.reply(f"Пользователь уже находится в Blacklist.\n\nID: {target.user_id}")
+        await message.reply(texts.blacklist_exists(target.user_id, verbose))
         return
     await db.log_action("addblacklist", executor.id, target.user_id, message.chat.id, reason, "success")
-    await message.reply(texts.blacklist_added(target.user_id, reason, display_name(executor)))
+    await message.reply(texts.blacklist_added(target.user_id, reason, display_name(executor), verbose))
 
 
 @router.message(Command("removeblacklist"))
 async def cmd_remove(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config):
-    target = await _target(message, command, bot, config)
+    target = await _target(message, command, bot, db, config)
     if target is None:
         return
     executor = message.from_user
+    verbose = message.chat.id in config.admin_chat_ids
     if not await db.remove_blacklist(target.user_id):
-        await message.reply(f"Пользователь не найден в Blacklist.\n\nID: {target.user_id}")
+        await message.reply(texts.blacklist_missing(target.user_id, verbose))
         return
     await db.log_action("removeblacklist", executor.id, target.user_id, message.chat.id, target.reason, "success")
-    await message.reply(
-        f"Пользователь удалён из Blacklist.\n\nID: {target.user_id}\nУдалил: {esc(display_name(executor))}."
-    )
+    await message.reply(texts.blacklist_removed(target.user_id, display_name(executor), verbose))
 
 
 @router.message(Command("blacklist"))
 async def cmd_list(message: Message, db: Database, config: Config):
     if message.chat.id not in config.admin_chat_ids:
-        await message.reply(f"{texts.SECURE_ONLY}\nЗаписей в Blacklist: {await db.count_blacklist()}.")
+        await message.reply(texts.SECURE_ONLY)
         return
     total = await db.count_blacklist()
     if not total:
@@ -89,10 +92,8 @@ async def cmd_list(message: Message, db: Database, config: Config):
 
 @router.message(Command("checkblacklist"))
 async def cmd_check(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config):
-    try:
-        target = parse_target(message, command.args)
-    except TargetError as exc:
-        await message.reply(str(exc))
+    target = await _target(message, command, bot, db, config, validate=False)
+    if target is None:
         return
     if message.chat.id not in config.admin_chat_ids:
         await message.reply(f"Результат проверки не публикуется в открытом чате. {texts.SECURE_ONLY}")
@@ -112,8 +113,15 @@ async def cmd_check(message: Message, command: CommandObject, bot: Bot, db: Data
 _recent_joins: dict[tuple[int, int], float] = {}
 
 
+async def _remember(db: Database, user) -> None:
+    """Запоминает пользователя, чтобы потом находить его по @username."""
+    if user is not None and not user.is_bot:
+        await db.upsert_user(user.id, user.username, display_name(user))
+
+
 async def _on_join(bot: Bot, db: Database, config: Config, chat, user) -> None:
     """Одно вступление может прийти и как chat_member, и как служебное сообщение: повтор отбрасывается."""
+    await _remember(db, user)
     key = (chat.id, user.id)
     now = time.monotonic()
     if now - _recent_joins.get(key, -1e9) < 30:
@@ -130,11 +138,13 @@ async def _on_join(bot: Bot, db: Database, config: Config, chat, user) -> None:
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot, db: Database, config: Config):
     if event.chat.type not in ("group", "supergroup"):
         return
-    old, new = str(getattr(event.old_chat_member.status, "value", event.old_chat_member.status)), str(
-        getattr(event.new_chat_member.status, "value", event.new_chat_member.status)
-    )
+    user = event.new_chat_member.user
+    old = str(getattr(event.old_chat_member.status, "value", event.old_chat_member.status))
+    new = str(getattr(event.new_chat_member.status, "value", event.new_chat_member.status))
     if old in ("left", "kicked") and new in ("member", "restricted"):
-        await _on_join(bot, db, config, event.chat, event.new_chat_member.user)
+        await _on_join(bot, db, config, event.chat, user)
+    else:
+        await _remember(db, user)
 
 
 @events_router.message(F.new_chat_members)

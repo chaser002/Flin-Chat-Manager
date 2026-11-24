@@ -61,9 +61,8 @@ async def cmd_chats(message: Message, db: Database, config: Config):
     total, active, with_rights = await db.chat_counts()
     if message.chat.id not in config.admin_chat_ids:
         await message.reply(
-            f"Подключено чатов: {total}, активных: {active}, с правом блокировки: {with_rights}.\n"
             f"{texts.SECURE_ONLY}\n"
-            f"ID этого чата: {message.chat.id}. Добавьте его в ADMIN_CHAT_IDS, чтобы видеть подробности здесь."
+            f"ID этого чата: {message.chat.id}. Чтобы видеть подробности здесь, добавьте его в ADMIN_CHAT_IDS."
         )
         return
     chats = await db.list_chats()
